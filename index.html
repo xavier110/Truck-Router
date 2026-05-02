@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Truck Router — Live GPS</title>
+  <meta name="application-name" content="Truck Router" />
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0f1419;
+      color: #e7ecf3;
+    }
+    #map {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      top: calc(52px + env(safe-area-inset-top, 0px));
+      z-index: 0;
+    }
+    .hud {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: max(12px, env(safe-area-inset-bottom));
+      z-index: 1000;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      pointer-events: none;
+    }
+    .hud > * { pointer-events: auto; }
+    .panel {
+      background: rgba(15, 20, 25, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-size: 13px;
+      line-height: 1.45;
+      max-width: 100%;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+    }
+    .panel strong { color: #7eb8ff; font-weight: 600; }
+    button {
+      appearance: none;
+      border: none;
+      border-radius: 10px;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      background: #2563eb;
+      color: #fff;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    button.secondary {
+      background: rgba(255, 255, 255, 0.12);
+      color: #e7ecf3;
+    }
+    .err { color: #fca5a5; }
+    .ok { color: #86efac; }
+    .user-marker-wrap {
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-left: -18px;
+      margin-top: -18px;
+    }
+    .user-marker-wrap svg {
+      filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
+    }
+    .app-header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 900;
+      padding: max(10px, env(safe-area-inset-top)) 14px 10px;
+      background: linear-gradient(180deg, rgba(15, 20, 25, 0.95) 0%, rgba(15, 20, 25, 0.75) 70%, transparent 100%);
+      pointer-events: none;
+    }
+    .app-header h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: #f1f5f9;
+    }
+    .app-header p {
+      margin: 2px 0 0;
+      font-size: 0.72rem;
+      color: #94a3b8;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <h1>Truck Router</h1>
+    <p>Live position</p>
+  </header>
+  <div id="map" role="application" aria-label="Truck Router map"></div>
+  <div class="hud">
+    <button type="button" id="btn-start">Start following GPS</button>
+    <button type="button" class="secondary" id="btn-recenter" disabled>Re-center</button>
+    <div class="panel" id="status">
+      <span class="err">Tap Start and allow location when the browser asks.</span>
+    </div>
+  </div>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <script>
+    (function () {
+      const statusEl = document.getElementById('status');
+      const btnStart = document.getElementById('btn-start');
+      const btnRecenter = document.getElementById('btn-recenter');
+
+      const map = L.map('map', {
+        zoomControl: true,
+        attributionControl: true,
+      }).setView([20, 0], 2);
+
+      function refreshMapSize() {
+        map.invalidateSize({ animate: false });
+      }
+
+      window.addEventListener('load', refreshMapSize);
+      window.addEventListener('resize', refreshMapSize);
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) refreshMapSize();
+      });
+      requestAnimationFrame(refreshMapSize);
+      setTimeout(refreshMapSize, 250);
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      }).addTo(map);
+
+      if (!window.isSecureContext) {
+        setStatus(
+          '<strong>Need a secure link</strong><br />' +
+            'GPS needs https:// (or localhost). Host this file on Netlify, Render, Cloudflare Pages, etc., then open that URL on your phone.',
+          true
+        );
+        btnStart.disabled = true;
+      }
+
+      let watchId = null;
+      let userMarker = null;
+      let lastHeading = null;
+      let userLatLng = null;
+      let userMovedMap = false;
+
+      function triangleHtml(headingDeg) {
+        const h = headingDeg == null || Number.isNaN(headingDeg) ? 0 : headingDeg;
+        return (
+          '<div class="user-marker-wrap" style="transform: rotate(' + h + 'deg);">' +
+          '<svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">' +
+          '<path fill="#f97316" stroke="#1a1a1a" stroke-width="1.2" ' +
+          'd="M14 4 L24 22 L14 18 L4 22 Z" />' +
+          '</svg></div>'
+        );
+      }
+
+      function setStatus(html, isError) {
+        statusEl.innerHTML = html;
+        statusEl.classList.toggle('err', !!isError);
+        statusEl.classList.toggle('ok', !isError && html.indexOf('strong') !== -1);
+      }
+
+      function ensureMarker(latlng, heading) {
+        if (userMarker) {
+          userMarker.setLatLng(latlng);
+          const el = userMarker.getElement();
+          if (el) {
+            const wrap = el.querySelector('.user-marker-wrap');
+            if (wrap) {
+              const deg = heading == null ? (lastHeading != null ? lastHeading : 0) : heading;
+              if (heading != null) lastHeading = heading;
+              wrap.style.transform = 'rotate(' + deg + 'deg)';
+            }
+          }
+          return;
+        }
+        const icon = L.divIcon({
+          className: 'user-gps-marker',
+          html: triangleHtml(heading),
+          iconSize: [36, 36],
+          iconAnchor: [18, 18],
+        });
+        userMarker = L.marker(latlng, { icon: icon, zIndexOffset: 1000 }).addTo(map);
+      }
+
+      function onPosition(pos) {
+        const { latitude, longitude, heading, speed, accuracy } = pos.coords;
+        userLatLng = L.latLng(latitude, longitude);
+        const h =
+          heading != null && !Number.isNaN(heading) ? heading : lastHeading;
+
+        ensureMarker(userLatLng, heading);
+
+        if (!userMovedMap) {
+          map.setView(userLatLng, Math.max(map.getZoom(), 15), { animate: true });
+        }
+
+        const acc = accuracy != null ? Math.round(accuracy) + ' m' : '—';
+        const spd =
+          speed != null && !Number.isNaN(speed)
+            ? (speed * 3.6).toFixed(1) + ' km/h'
+            : '—';
+        const headTxt =
+          heading != null && !Number.isNaN(heading)
+            ? Math.round(heading) + '°'
+            : lastHeading != null
+              ? '~' + Math.round(lastHeading) + '°'
+              : '—';
+
+        setStatus(
+          '<strong>Tracking</strong><br />' +
+            'Lat ' + latitude.toFixed(5) + ', Lon ' + longitude.toFixed(5) + '<br />' +
+            'Accuracy ' + acc + ' · Speed ' + spd + ' · Heading ' + headTxt,
+          false
+        );
+      }
+
+      function onError(err) {
+        let msg = err.message || String(err.code);
+        if (err.code === 1) msg = 'Location permission denied. Allow location for this site in your browser settings.';
+        else if (err.code === 2) msg = 'Position unavailable (try outdoors or check GPS).';
+        else if (err.code === 3) msg = 'Location request timed out.';
+        setStatus('<strong>Location error</strong><br />' + msg, true);
+        btnStart.disabled = false;
+        btnStart.textContent = 'Try again';
+      }
+
+      function startWatch() {
+        if (!navigator.geolocation) {
+          setStatus('Geolocation is not supported in this browser.', true);
+          return;
+        }
+        btnStart.disabled = true;
+        btnStart.textContent = 'Starting…';
+        userMovedMap = false;
+        setStatus('Waiting for first fix…', false);
+
+        const opts = {
+          enableHighAccuracy: true,
+          maximumAge: 0,
+          timeout: 20000,
+        };
+
+        if (watchId != null) {
+          navigator.geolocation.clearWatch(watchId);
+          watchId = null;
+        }
+
+        watchId = navigator.geolocation.watchPosition(onPosition, onError, opts);
+        btnRecenter.disabled = false;
+        btnStart.textContent = 'Tracking…';
+      }
+
+      btnStart.addEventListener('click', startWatch);
+
+      btnRecenter.addEventListener('click', function () {
+        if (!userLatLng) return;
+        userMovedMap = false;
+        map.setView(userLatLng, Math.max(map.getZoom(), 15), { animate: true });
+      });
+
+      map.on('dragstart', function () {
+        userMovedMap = true;
+      });
+    })();
+  </script>
+</body>
+</html>
